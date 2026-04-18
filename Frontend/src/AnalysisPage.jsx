@@ -1,42 +1,185 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { useLocation, Link } from 'react-router-dom'
+import ReactFlow, { 
+  Background, 
+  Controls, 
+  useNodesState, 
+  useEdgesState, 
+  useReactFlow 
+} from 'reactflow'
+import { Search, Send, ArrowLeft, Cpu, Terminal, Sparkles } from 'lucide-react'
+import { mockAnalysis } from './data/mockAnalysis'
+import { analyzeRepository, queryCodebase } from './services/api'
+
+const DEFAULT_NODE_STYLE = {
+  background: '#111111',
+  color: '#fff',
+  border: '1px solid rgba(255, 255, 255, 0.1)',
+  borderRadius: '12px',
+  padding: '10px',
+  fontSize: '12px',
+  width: 150,
+  textAlign: 'center',
+  transition: 'all 0.3s ease'
+};
+
+const HIGHLIGHT_NODE_STYLE = {
+  background: 'rgba(59, 130, 246, 0.2)',
+  color: '#fff',
+  border: '2px solid #3b82f6',
+  borderRadius: '12px',
+  padding: '10px',
+  fontSize: '12px',
+  width: 150,
+  textAlign: 'center',
+  boxShadow: '0 0 20px rgba(59, 130, 246, 0.4)',
+  transition: 'all 0.3s ease'
+};
 
 function AnalysisPage() {
   const location = useLocation()
   const repoUrl = location.state?.repoUrl || ''
-  const [messages, setMessages] = useState([
-    { id: 1, role: 'assistant', text: `Analysis of ${repoUrl || 'the repository'} complete. How can I help you understand the codebase?` }
-  ])
+  const { setCenter } = useReactFlow()
+  
+  // 1. Core State
+  const [analysisResult, setAnalysisResult] = useState(null)
+  const [nodes, setNodes, onNodesChange] = useNodesState([])
+  const [edges, setEdges, onEdgesChange] = useEdgesState([])
+  const [messages, setMessages] = useState([])
   const [inputValue, setInputValue] = useState('')
+  const [isLoading, setIsLoading] = useState(true) // Start loading by default
+
+  // 2. Refs for Stale State Protection
+  const nodesRef = useRef(nodes)
   const scrollRef = useRef(null)
 
+  useEffect(() => {
+    nodesRef.current = nodes
+  }, [nodes])
+
+  // 3. Graph Synchronization Logic
+  const syncGraph = useCallback((result) => {
+    if (!result || !result.graph) return;
+
+    const rfNodes = result.graph.nodes.map(node => ({
+      id: node.id,
+      position: node.position || { x: 0, y: 0 },
+      data: { label: node.label },
+      style: DEFAULT_NODE_STYLE
+    }));
+
+    const rfEdges = result.graph.edges.map((edge, idx) => ({
+      id: `e-${edge.source}-${edge.target}-${idx}`,
+      source: edge.source,
+      target: edge.target,
+      animated: true,
+      style: { stroke: 'rgba(255, 255, 255, 0.1)' }
+    }));
+
+    setNodes(rfNodes);
+    setEdges(rfEdges);
+  }, [setNodes, setEdges]);
+
+  // Initial Analysis Trigger
+  useEffect(() => {
+    const triggerAnalysis = async () => {
+      try {
+        setIsLoading(true);
+        const result = await analyzeRepository(repoUrl);
+        setAnalysisResult(result);
+        syncGraph(result);
+        setMessages([
+          { id: 1, role: 'assistant', text: `Analysis of ${repoUrl || 'the repository'} complete. I've mapped the core architecture. How can I help you explore it?` }
+        ]);
+      } catch (error) {
+        console.error("Initial Analysis Error:", error);
+        // Fallback to mock on failure
+        setAnalysisResult(mockAnalysis);
+        syncGraph(mockAnalysis);
+        setMessages([
+          { id: 1, role: 'assistant', text: "I couldn't reach the live analysis engine. Showing a stored architectural snapshot instead." }
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    triggerAnalysis();
+  }, [repoUrl, syncGraph]);
+
+  // Scroll to bottom of chat
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
   }, [messages])
 
-  const handleSendMessage = (e) => {
+  // 4. Query & UI Logic
+  const handleSendMessage = async (e) => {
     e.preventDefault()
-    if (!inputValue.trim()) return
+    if (!inputValue.trim() || isLoading) return
 
-    const newUserMsg = { id: messages.length + 1, role: 'user', text: inputValue }
-    setMessages([...messages, newUserMsg])
+    const userQuery = inputValue
+    const newUserMsg = { id: Date.now(), role: 'user', text: userQuery }
+    setMessages(prev => [...prev, newUserMsg])
     setInputValue('')
+    setIsLoading(true)
 
-    // Mock bot response
-    setTimeout(() => {
+    try {
+      // API Call to Backend
+      const response = await queryCodebase(userQuery, analysisResult);
+
       const botResponse = {
-        id: messages.length + 2,
+        id: Date.now() + 1,
         role: 'assistant',
-        text: `I've analyzed the architecture related to "${inputValue}". The primary data flow involves the main controller and its associated middleware layers.`
+        text: response.answer
       }
       setMessages(prev => [...prev, botResponse])
-    }, 1000)
+
+      // 5. Highlight Logic (Refined)
+      setNodes((nds) => nds.map(node => {
+        const isHighlighted = response.highlightNodes.includes(node.id);
+        return {
+          ...node,
+          style: isHighlighted ? HIGHLIGHT_NODE_STYLE : DEFAULT_NODE_STYLE
+        };
+      }));
+
+      // 6. Zoom Logic (50ms Tactical Delay)
+      if (response.focusNode) {
+        setTimeout(() => {
+          const targetNode = nodesRef.current.find(n => n.id === response.focusNode);
+          if (targetNode) {
+            setCenter(targetNode.position.x + 75, targetNode.position.y + 25, { 
+              zoom: 1.5, 
+              duration: 800 
+            });
+          }
+        }, 50);
+      }
+
+    } catch (error) {
+      console.error("Query Error:", error);
+      const errorMsg = {
+        id: Date.now() + 1,
+        role: 'assistant',
+        text: "I encountered an issue connecting to the analysis engine. However, I can still show you the primary entry points of the system."
+      }
+      setMessages(prev => [...prev, errorMsg])
+      
+      // Fallback Highlights
+      const fallbackNodes = analysisResult.views.entryPoints;
+      setNodes(nds => nds.map(n => ({
+        ...n,
+        style: fallbackNodes.includes(n.id) ? HIGHLIGHT_NODE_STYLE : DEFAULT_NODE_STYLE
+      })));
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   return (
-    <div className="flex flex-col md:flex-row h-screen w-full bg-[#000000] text-white font-inter overflow-hidden">
+    <div className="flex flex-col md:flex-row h-screen w-full bg-transparent text-white font-inter overflow-hidden">
       {/* Background Glows */}
       <div className="fixed top-[-10%] left-[-10%] w-[500px] h-[500px] bg-blue-600/5 rounded-full blur-[120px] pointer-events-none"></div>
       <div className="fixed bottom-[-10%] right-[-10%] w-[500px] h-[500px] bg-purple-600/5 rounded-full blur-[120px] pointer-events-none"></div>
@@ -46,47 +189,49 @@ function AnalysisPage() {
         <header className="px-8 py-5 border-b border-white/5 flex items-center justify-between backdrop-blur-md bg-black/20">
           <div className="flex items-center gap-4">
             <Link to="/" className="text-gray-400 hover:text-white transition-colors flex items-center gap-2 text-sm group">
-              <span className="group-hover:-translate-x-1 transition-transform">←</span> Back
+              <ArrowLeft className="w-4 h-4 group-hover:-translate-x-1 transition-transform" /> Back
             </Link>
-            <h2 className="text-lg font-semibold tracking-tight">
+            <h2 className="text-lg font-semibold tracking-tight flex items-center gap-2">
+              <Cpu className="w-5 h-5 text-blue-500" />
               Architecture <span className="text-blue-500">Explorer</span>
             </h2>
           </div>
-          <div className="text-xs font-mono text-gray-500 bg-white/5 px-3 py-1 rounded-full border border-white/10">
-            {repoUrl ? repoUrl.replace('https://github.com/', '') : 'repository'}
+          <div className="text-xs font-mono text-gray-500 bg-white/5 px-3 py-1 rounded-full border border-white/10 uppercase tracking-widest">
+            {repoUrl ? repoUrl.replace('https://github.com/', '') : 'DEMO_MODE'}
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-thin scrollbar-thumb-white/10">
-          {/* Mock Graph Containers */}
-          <div className="w-full aspect-video bg-[#0a0a0a] border border-white/5 rounded-3xl p-8 flex flex-col justify-center items-center relative group overflow-hidden">
-            <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-700"></div>
-            <div className="text-blue-500/20 text-8xl mb-4 font-bold select-none">FLOW</div>
-            <h3 className="text-xl font-bold mb-2">System Architecture Flow</h3>
-            <p className="text-gray-500 text-sm max-w-md text-center">Interactive mapping of service communications and data pipelines.</p>
-          </div>
-
-          <div className="w-full aspect-video bg-[#0a0a0a] border border-white/5 rounded-3xl p-8 flex flex-col justify-center items-center relative group overflow-hidden">
-            <div className="absolute inset-0 bg-gradient-to-br from-purple-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-700"></div>
-            <div className="text-purple-500/20 text-8xl mb-4 font-bold select-none">TREE</div>
-            <h3 className="text-xl font-bold mb-2">Dependency Tree</h3>
-            <p className="text-gray-500 text-sm max-w-md text-center">Hierarchical visualization of internal modules and third-party libraries.</p>
-          </div>
-
-          <div className="w-full aspect-square md:aspect-video bg-[#0a0a0a] border border-white/5 rounded-3xl p-8 flex flex-col justify-center items-center relative group overflow-hidden">
-             <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-700"></div>
-            <div className="text-cyan-500/20 text-8xl mb-4 font-bold select-none">LOGIC</div>
-            <h3 className="text-xl font-bold mb-2">Business Logic Map</h3>
-            <p className="text-gray-500 text-sm max-w-md text-center">Tracing functional execution paths and state transitions.</p>
+        <main className="flex-1 relative">
+          <ReactFlow
+            nodes={nodes}
+            edges={edges}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            fitView
+            style={{ background: 'transparent' }}
+          >
+            <Background color="#333" gap={20} />
+            <Controls />
+          </ReactFlow>
+          
+          {/* Overlay info */}
+          <div className="absolute bottom-8 right-8 z-20 flex gap-4">
+               <div className="px-4 py-2 bg-black/60 backdrop-blur-md border border-white/10 rounded-xl text-[10px] text-gray-400 font-mono uppercase tracking-widest flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-blue-500"></div>
+                    Direct Map: 100%
+               </div>
           </div>
         </main>
       </div>
 
-      {/* Right Section: Chatbot Panel (30% / 350px on desktop) */}
-      <div className="w-full md:w-[380px] flex flex-col h-[500px] md:h-screen bg-[#050505] relative z-10 border-l border-white/5">
-        <header className="px-6 py-5 border-b border-white/5 flex items-center gap-3">
-          <div className="w-2.5 h-2.5 rounded-full bg-green-500 animate-pulse"></div>
-          <h2 className="text-sm font-bold uppercase tracking-widest text-gray-400">Codebase AI</h2>
+      {/* Right Section: Chatbot Panel */}
+      <div className="w-full md:w-[380px] flex flex-col h-[500px] md:h-screen bg-[#050505] relative z-10 border-l border-white/5 shadow-2xl">
+        <header className="px-6 py-5 border-b border-white/5 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className={`w-2 h-2 rounded-full ${isLoading ? 'bg-blue-500 animate-pulse' : 'bg-green-500'}`}></div>
+            <h2 className="text-[10px] font-bold uppercase tracking-[0.2em] text-gray-500">Architecture AI</h2>
+          </div>
+          <Sparkles className="w-4 h-4 text-gray-600" />
         </header>
 
         {/* Messages Area */}
@@ -96,15 +241,26 @@ function AnalysisPage() {
         >
           {messages.map((msg) => (
             <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] px-5 py-3 rounded-2xl text-sm leading-relaxed ${
+              <div className={`max-w-[90%] px-4 py-3 rounded-2xl text-[13px] leading-relaxed ${
                 msg.role === 'user' 
-                ? 'bg-blue-600 text-white rounded-br-none' 
+                ? 'bg-blue-600 text-white rounded-br-none shadow-lg shadow-blue-500/20' 
                 : 'bg-white/5 border border-white/10 text-gray-300 rounded-bl-none'
               }`}>
                 {msg.text}
               </div>
             </div>
           ))}
+          {isLoading && (
+            <div className="flex justify-start">
+               <div className="bg-white/5 border border-white/10 px-4 py-3 rounded-2xl rounded-bl-none">
+                    <div className="flex gap-1">
+                         <div className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce"></div>
+                         <div className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce [animation-delay:0.2s]"></div>
+                         <div className="w-1.5 h-1.5 bg-gray-500 rounded-full animate-bounce [animation-delay:0.4s]"></div>
+                    </div>
+               </div>
+            </div>
+          )}
         </div>
 
         {/* Input Area */}
@@ -114,17 +270,23 @@ function AnalysisPage() {
               type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Ask about this repository..."
-              className="w-full bg-white/5 border border-white/10 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all placeholder:text-gray-600"
+              placeholder="Query system structure..."
+              className="w-full bg-white/5 border border-white/10 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all placeholder:text-gray-500 pr-12"
             />
             <button 
               type="submit"
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-2 bg-white text-black rounded-xl hover:bg-blue-500 hover:text-white transition-all active:scale-90"
+              disabled={isLoading}
+              className={`absolute right-3 top-1/2 -translate-y-1/2 p-2 rounded-xl transition-all active:scale-95 ${
+                isLoading ? 'bg-gray-800 text-gray-600' : 'bg-white text-black hover:bg-blue-500 hover:text-white'
+              }`}
             >
-              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+              <Send className="w-4 h-4" />
             </button>
           </form>
-          <p className="text-[10px] text-gray-600 text-center mt-4 uppercase tracking-tighter">Powered by Codebase GPS Engine</p>
+          <div className="flex items-center justify-center gap-2 mt-4 opacity-50">
+               <Terminal className="w-3 h-3 text-gray-600" />
+               <p className="text-[9px] text-gray-600 uppercase tracking-widest font-bold">Deterministic GPU Engine</p>
+          </div>
         </div>
       </div>
     </div>
